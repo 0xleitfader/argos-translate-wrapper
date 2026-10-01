@@ -1,0 +1,152 @@
+#!/usr/bin/python3
+"""Argos Translate wrapper with language detection and fast CLI translation.
+
+  translate                   interactive: type a line, get the translation (Ctrl-D to quit)
+  translate Hallo Welt        translate the arguments
+  echo "Hello" | translate    translate standard input
+  translate -t de Hi there    force the target language (en or de)
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import sys
+import threading
+from difflib import SequenceMatcher
+
+# stanza and spacy are optional sentence splitters; stanza alone pulls in torch and adds ~4s
+# of startup. Blocking them makes argostranslate fall back to the lightweight MiniSBD.
+sys.modules.setdefault("stanza", None)
+sys.modules.setdefault("spacy", None)
+os.environ.setdefault("ARGOS_CHUNK_TYPE", "MINISBD")
+logging.disable(logging.WARNING)
+
+DE_WORDS = set("""
+    der die das den dem des ein eine einen einem einer eines und oder aber nicht nichts ist sind
+    bist habe haben hast hatte wurde wird werden ich du er sie es wir ihr mich mir dich dir uns
+    euch ihm ihn ihnen sich mit von zu zum zur auf für bei aus nach über unter vor durch gegen ohne
+    zwischen wie wer wo warum wann dass daß auch noch nur schon sehr mein meine dein deine sein
+    seine unser kein keine ja nein bitte danke hallo tschüss gut heute morgen hier dort jetzt immer
+    mehr kann können muss müssen soll will möchte als wenn weil doch mal ganz gibt geht etwas viel
+    viele alle diese dieser dieses jeder wieder oft denn ob sondern guten tag abend nacht
+""".split())
+
+EN_WORDS = set("""
+    the a and or but not is are were be been being i you he she it we they me him us them my your
+    his its our their this that these those with of to from for on at by if then than what who
+    where why when how which there here do does did don't doesn't didn't can can't cannot won't
+    would should could have has had just very about into out up down all any some no yes please
+    thanks thank hello hi bye good today tomorrow now always more one it's i'm you're that's let's
+    get got like want need know think morning evening night
+""".split())
+
+# Letter patterns that are much more common in one language than the other.
+DE_PATTERNS = re.compile(r"[äöüß]|sch|cht|tz|pf|ung\b|keit|heit|lich|chen\b|\bz|ei|ie")
+EN_PATTERNS = re.compile(r"th|\bwh|ing\b|tion|ly\b|ould|ght|ou|ea|w\b|y\b|c(?![hk])")
+
+
+def heuristic_score(text: str) -> float:
+    """Positive means German, negative means English, near zero means unsure."""
+    words = re.findall(r"[^\W\d_]+(?:'[^\W\d_]+)?", text.lower())
+    score = 0.0
+    for word in words:
+        score += (word in DE_WORDS) - (word in EN_WORDS)
+        score += 0.3 * (len(DE_PATTERNS.findall(word)) - len(EN_PATTERNS.findall(word)))
+        if re.search(r"[äöüß]", word):
+            score += 2
+    return score
+
+
+class Translator:
+    def __init__(self):
+        from argostranslate import translate
+
+        langs = {lang.code: lang for lang in translate.get_installed_languages()}
+        missing = [
+            f"translate-{a}_{b}"
+            for a, b in (("de", "en"), ("en", "de"))
+            if a not in langs or b not in langs or langs[a].get_translation(langs[b]) is None
+        ]
+        if missing:
+            raise SystemExit(f"translate: missing model(s), run: argospm install {' '.join(missing)}")
+        self.models = {
+            "en": langs["de"].get_translation(langs["en"]),  # target -> model
+            "de": langs["en"].get_translation(langs["de"]),
+        }
+
+    def translate(self, text: str, to: str | None = None) -> tuple[str, str]:
+        """Returns (source language, translation)."""
+        if to is None:
+            score = heuristic_score(text)
+            if score >= 1:
+                to = "en"
+            elif score <= -1:
+                to = "de"
+            else:
+                return self._translate_by_model_vote(text)
+        return ("de" if to == "en" else "en"), self.models[to].translate(text)
+
+    def _translate_by_model_vote(self, text: str) -> tuple[str, str]:
+        # Feeding a model text that is already in its target language mostly echoes it back,
+        # so the direction whose output changed the input more is the real one.
+        as_german = self.models["en"].translate(text)
+        as_english = self.models["de"].translate(text)
+        changed_as_german = 1 - SequenceMatcher(None, text.lower(), as_german.lower()).ratio()
+        changed_as_english = 1 - SequenceMatcher(None, text.lower(), as_english.lower()).ratio()
+        if changed_as_english > changed_as_german:
+            return "en", as_english
+        return "de", as_german
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="translate",
+        description="Translate between English and German, detecting the input language.",
+    )
+    parser.add_argument("text", nargs="*", help="text to translate (default: stdin or interactive)")
+    parser.add_argument("-t", "--to", choices=("en", "de"), help="force the target language")
+    args = parser.parse_args()
+
+    if args.text or not sys.stdin.isatty():
+        text = " ".join(args.text) if args.text else sys.stdin.read()
+        if not text.strip():
+            return
+        source, result = Translator().translate(text.strip(), args.to)
+        if sys.stderr.isatty():
+            print(f"\033[2m{source} → {'de' if source == 'en' else 'en'}\033[0m", file=sys.stderr)
+        print(result)
+        return
+
+    # Interactive mode
+    import readline  
+
+    loaded = {}
+
+    def load():
+        try:
+            loaded["t"] = Translator()
+        except SystemExit as e:
+            loaded["error"] = e
+
+    loader = threading.Thread(target=load, daemon=True)
+    loader.start()
+    print("\033[2mEN ⇄ DE — type text and press Enter, Ctrl-D to quit\033[0m")
+    while True:
+        try:
+            text = input("› ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not text:
+            continue
+        loader.join()
+        if "error" in loaded:
+            raise loaded["error"]
+        source, result = loaded["t"].translate(text, args.to)
+        print(f"\033[2m{source} → {'de' if source == 'en' else 'en'}\033[0m  {result}")
+
+
+if __name__ == "__main__":
+    main()
